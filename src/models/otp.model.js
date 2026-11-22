@@ -15,6 +15,11 @@ const otpSchema = new Schema({
     type: String,
     required:[true,"OTP is required!!"]
   },
+  purpose: {
+    type: String,
+    enum: ["email-verification", "password-reset"],
+    required: true
+  },
   expiresAt: {
     type: Date,
     required: true

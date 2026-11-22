@@ -2,7 +2,6 @@ import mongoose,{Schema} from "mongoose"
 import bcrypt from "bcrypt"
 import jwt from "jsonwebtoken"
 import config from "../config/config.js";
-import { Session } from "./session.model.js";
 
 const userSchema = new Schema({
   username:{
@@ -22,6 +21,30 @@ const userSchema = new Schema({
   verified:{
     type: Boolean,
     default: false
+  },
+  otpLastSentAt: {
+    type: Date,
+    default: null
+  },
+  otpSendWindowStartedAt: {
+    type: Date,
+    default: null
+  },
+  otpSendCount: {
+    type: Number,
+    default: 0
+  },
+  passwordOtpLastSentAt: {
+    type: Date,
+    default: null
+  },
+  passwordOtpWindowStartedAt: {
+    type: Date,
+    default: null
+  },
+  passwordOtpSendCount: {
+    type: Number,
+    default: 0
   }
 });
 

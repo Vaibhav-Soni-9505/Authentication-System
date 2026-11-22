@@ -8,8 +8,10 @@ import mongoose from "mongoose";
 import bcrypt from "bcrypt"
 import { Session } from "../models/session.model.js";
 import { sendEmail } from "../services/email.service.js";
-import { generateOTP, otpTemplate } from "../utils/otpTemplate.js";
+import { generateOTP, emailVerificationOtpTemplate } from "../utils/emailVerificaionOtpTemplate.js";
+import { passwordResetOtpTemplate } from "../utils/passwordResetOtpTempelate.js";
 import { OTP } from "../models/otp.model.js";
+import { OTP_COOLDOWN,OTP_WINDOW,MAX_OTP_SENDS,OTP_EXPIRY } from "../config/otp.constants.js";
 
 
 const generateAccessandRefreshToken = async(user,req)=>{
@@ -50,14 +52,20 @@ const registerUser = asyncHandler(async(req,res)=>{
     throw new ApiError(409,"User Already Exists");
   }
 
+  const now = new Date();
+
+
   const user = await User.create({
     username,
     email,
-    password
+    password,
+    otpLastSentAt: now,
+    otpSendWindowStartedAt: now,
+    otpSendCount: 1
   })
 
   const otp = generateOTP();
-  const html = otpTemplate(otp);
+  const html = emailVerificationOtpTemplate(otp);
 
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
@@ -65,6 +73,7 @@ const registerUser = asyncHandler(async(req,res)=>{
     email,
     user: user._id,
     otpHash:otp,
+    purpose:"email-verification",
     expiresAt
   });
 
@@ -226,35 +235,55 @@ const logoutAllDevice = asyncHandler(async(req,res)=>{
   .json(new ApiResponse(200,"User Logged out from all Devices Successfully!!",{sessionRevoked:session.modifiedCount}))
 })
 
-const verifyEmail = asyncHandler(async(req,res)=>{
-  const {otp,email} = req.body;
 
-  const otpModel = await OTP.findOne({email});
-  if(!otpModel){
-    throw new ApiError(404,"OTP has expired, or not found.")
+const verifyEmail = asyncHandler(async (req, res) => {
+  const { otp, email } = req.body;
+
+  // 1. Validate request body
+  if (!email || !otp) {
+    throw new ApiError(400, "Email and OTP are required");
   }
 
-  if(otpModel.expiresAt <= new Date()){
-    await OTP.deleteOne({
-      _id: otpModel._id
-    });
-
-    throw new ApiError(410,"OTP has expired. Please request a new OTP.")
+  if (typeof otp !== "string" || !/^\d{6}$/.test(otp)) {
+    throw new ApiError(400, "OTP must be a valid 6-digit code");
   }
 
-  const MAX_ATTEMPTS = 5;
+  // 2. Find the latest OTP
+  const otpModel = await OTP.findOne({
+    email: email.trim().toLowerCase(),
+    purpose: "email-verification"
+  }).sort({ createdAt: -1 });
 
-  if (otpModel.attempts >= MAX_ATTEMPTS) {
-    throw new ApiError(429, "Maximum OTP attempts reached. Please request a new OTP.");
+  if (!otpModel) {
+    throw new ApiError(404, "OTP has expired or not found.");
   }
 
+  // 3. Check expiration
+  if (otpModel.expiresAt <= new Date()) {
+    await OTP.deleteOne({ _id: otpModel._id });
+
+    throw new ApiError(
+      410,
+      "OTP has expired. Please request a new OTP."
+    );
+  }
+
+  // 4. Check maximum attempts
+  if (otpModel.attempts >= MAX_OTP_SENDS) {
+    throw new ApiError(
+      429,
+      "Maximum OTP attempts reached. Please request a new OTP."
+    );
+  }
+
+  // 5. Verify OTP using bcrypt
   const isOtpValid = await otpModel.isOtpCorrect(otp);
 
   if (!isOtpValid) {
     const updatedOtp = await OTP.findOneAndUpdate(
       {
         _id: otpModel._id,
-        attempts: { $lt: MAX_ATTEMPTS },
+        attempts: { $lt: MAX_OTP_SENDS },
         expiresAt: { $gt: new Date() }
       },
       {
@@ -264,25 +293,528 @@ const verifyEmail = asyncHandler(async(req,res)=>{
     );
 
     if (!updatedOtp) {
-      throw new ApiError(429, "Maximum OTP attempts reached or OTP expired.");
+      throw new ApiError(
+        429,
+        "Maximum OTP attempts reached or OTP expired."
+      );
+    }
+
+    if (updatedOtp.attempts >= MAX_OTP_SENDS) {
+      throw new ApiError(
+        429,
+        "Maximum OTP attempts reached. Please request a new OTP."
+      );
     }
 
     throw new ApiError(401, "Invalid OTP");
   }
 
-  const user = await User.findByIdAndUpdate(otpModel.user,
-    {verified: true},
-    {new: true}
-  ).select("-password");
+  // 6. Check whether the user exists
+  const existingUser = await User.findById(otpModel.user);
 
-  await OTP.deleteMany({
-    user: otpModel.user
+  if (!existingUser) {
+    await OTP.deleteMany({ user: otpModel.user });
+    throw new ApiError(404, "User not found");
+  }
+
+  if (existingUser.verified) {
+    await OTP.deleteMany({ user: otpModel.user });
+
+    throw new ApiError(400, "Email is already verified");
+  }
+
+  // 7. Atomically consume the OTP
+  const consumedOtp = await OTP.findOneAndDelete({
+    _id: otpModel._id,
+    attempts: { $lt: MAX_OTP_SENDS },
+    expiresAt: { $gt: new Date() }
   });
 
-  return res
-  .status(200)
-  .json(new ApiResponse(200,"Email Verified Successfully",{user}))
-})
+  if (!consumedOtp) {
+    throw new ApiError(
+      409,
+      "OTP has already been used or expired. Please try again."
+    );
+  }
+
+  // 8. Mark the user as verified
+  const user = await User.findByIdAndUpdate(
+    consumedOtp.user,
+    { verified: true },
+    { new: true }
+  ).select("-password");
+
+  if (!user) {
+    throw new ApiError(404, "User not found");
+  }
+
+  // 9. Delete any remaining OTP records
+  await OTP.deleteMany({
+    user: consumedOtp.user
+  });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      "Email Verified Successfully",
+      { user }
+    )
+  );
+});
+
+
+const resendOTP = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    throw new ApiError(400, "Email is required");
+  }
+
+  const user = await User.findOne({ email });
+
+  if (!user) {
+    throw new ApiError(404, "User not found");
+  }
+
+  if (user.verified) {
+    throw new ApiError(400, "Email is already verified");
+  }
+
+  const now = new Date();
+
+  const cooldownCutoff = new Date(now.getTime() - OTP_COOLDOWN);
+  const windowCutoff = new Date(now.getTime() - OTP_WINDOW);
+
+  // Atomically reserve an OTP send slot.
+  // The hourly window resets when its starting time is older than 1 hour.
+  const updatedUser = await User.findOneAndUpdate(
+    {
+      _id: user._id,
+      verified: false,
+
+      // Cooldown check
+      otpLastSentAt: { $lte: cooldownCutoff },
+
+      // Hourly limit check
+      $or: [
+        { otpSendWindowStartedAt: { $lte: windowCutoff } },
+        { otpSendCount: { $lt: MAX_OTP_SENDS } }
+      ]
+    },
+    [
+      {
+        $set: {
+          otpSendCount: {
+            $cond: [
+              { $lte: ["$otpSendWindowStartedAt", windowCutoff] },
+              1,
+              { $add: ["$otpSendCount", 1] }
+            ]
+          },
+          otpSendWindowStartedAt: {
+            $cond: [
+              { $lte: ["$otpSendWindowStartedAt", windowCutoff] },
+              now,
+              "$otpSendWindowStartedAt"
+            ]
+          },
+          otpLastSentAt: now
+        }
+      }
+    ],
+    { 
+      new: true,
+      updatePipeline: true
+    }
+    
+  );
+
+  if (!updatedUser) {
+    // Fetch latest values to identify why the request was rejected.
+    const latestUser = await User.findById(user._id);
+
+    if (!latestUser) {
+      throw new ApiError(404, "User not found");
+    }
+
+    const cooldownRemaining =
+      OTP_COOLDOWN - (now.getTime() - latestUser.otpLastSentAt.getTime());
+
+    if (cooldownRemaining > 0) {
+      throw new ApiError(
+        429,
+        `Please wait ${Math.ceil(cooldownRemaining / 1000)} seconds before requesting another OTP`
+      );
+    }
+
+    throw new ApiError(
+      429,
+      "Maximum OTP resend limit reached. Please try again after one hour."
+    );
+  }
+
+  // Generate new OTP
+  const otp = generateOTP();
+  const html = emailVerificationOtpTemplate(otp);
+  const expiresAt = new Date(now.getTime() + OTP_EXPIRY);
+
+  // Store the new OTP without deleting the previous one yet
+  const newOtp = await OTP.create({
+    email: user.email,
+    user: user._id,
+    otpHash: otp,
+    purpose:"email-verification",
+    expiresAt
+  });
+
+  // Try sending the new OTP
+  try {
+    await sendEmail(
+      user.email,
+      "Email Verification OTP",
+      `Your OTP is ${otp}. It is valid for 5 minutes.`,
+      html
+    );
+  } catch (error) {
+    try {
+      await OTP.deleteOne({ _id: newOtp._id });
+    } catch (cleanupError) {
+      console.error("Failed to clean up new OTP:", cleanupError);
+    }
+
+    throw error;
+}
+
+  // Email sent successfully: now remove previous OTPs
+  await OTP.deleteMany({
+    user: user._id,
+    purpose: "email-verification",
+    _id: { $ne: newOtp._id }
+  });
+
+  return res.status(200).json(
+  new ApiResponse(200, "Email Verification OTP sent successfully", {
+    email: user.email,
+    expiresIn: OTP_EXPIRY / 1000,
+    resendAfter: OTP_COOLDOWN / 1000
+  })
+);
+});
+
+
+const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    throw new ApiError(400, "Email is required!!");
+  }
+
+  const existingUser = await User.findOne({
+    email: email.trim().toLowerCase(),
+    verified: true
+  });
+
+  if (!existingUser) {
+    throw new ApiError(404, "User not Found!!");
+  }
+
+  const now = new Date();
+
+  const cooldownCutoff = new Date(
+    now.getTime() - OTP_COOLDOWN
+  );
+
+  const windowCutoff = new Date(
+    now.getTime() - OTP_WINDOW
+  );
+
+  // 1. Apply password-reset rate limiting
+  const updatedUser = await User.findOneAndUpdate(
+    {
+      _id: existingUser._id,
+      verified: true,
+      $or: [
+        { passwordOtpLastSentAt: null },
+        { passwordOtpLastSentAt: { $lte: cooldownCutoff } }
+      ],
+      $and: [
+        {
+          $or: [
+            { passwordOtpWindowStartedAt: null },
+            { passwordOtpWindowStartedAt: { $lte: windowCutoff } },
+            { passwordOtpSendCount: { $lt: MAX_OTP_SENDS } }
+          ]
+        }
+      ]
+    },
+    [
+      {
+        $set: {
+          passwordOtpSendCount: {
+            $cond: [
+              {
+                $or: [
+                  { $eq: ["$passwordOtpWindowStartedAt", null] },
+                  {
+                    $lte: [
+                      "$passwordOtpWindowStartedAt",
+                      windowCutoff
+                    ]
+                  }
+                ]
+              },
+              1,
+              { $add: ["$passwordOtpSendCount", 1] }
+            ]
+          },
+
+          passwordOtpWindowStartedAt: {
+            $cond: [
+              {
+                $or: [
+                  { $eq: ["$passwordOtpWindowStartedAt", null] },
+                  {
+                    $lte: [
+                      "$passwordOtpWindowStartedAt",
+                      windowCutoff
+                    ]
+                  }
+                ]
+              },
+              now,
+              "$passwordOtpWindowStartedAt"
+            ]
+          },
+
+          passwordOtpLastSentAt: now
+        }
+      }
+    ],
+    {
+      new: true,
+      updatePipeline: true
+    }
+  );
+
+  // 2. Handle rate-limit failure
+  if (!updatedUser) {
+    const latestUser = await User.findById(existingUser._id);
+
+    const cooldownRemaining = latestUser.passwordOtpLastSentAt
+      ? OTP_COOLDOWN -
+        (now.getTime() - latestUser.passwordOtpLastSentAt.getTime())
+      : 0;
+
+    if (cooldownRemaining > 0) {
+      throw new ApiError(
+        429,
+        `Please wait ${Math.ceil(cooldownRemaining / 1000)} seconds before requesting another OTP`
+      );
+    }
+
+    throw new ApiError(
+      429,
+      "Maximum password-reset OTP requests reached. Please try again after one hour."
+    );
+  }
+
+  // 3. Generate OTP
+  const otp = generateOTP();
+  const html = passwordResetOtpTemplate(otp);
+  const expiresAt = new Date(now.getTime() + OTP_EXPIRY);
+
+  const passwordOtp = await OTP.create({
+    email: existingUser.email,
+    user: existingUser._id,
+    otpHash: otp,
+    purpose: "password-reset",
+    expiresAt
+  });
+
+  // 4. Send email
+  try {
+    await sendEmail(
+      existingUser.email,
+      "Password-Reset OTP",
+      `Your OTP is ${otp}. It is valid for 5 minutes.`,
+      html
+    );
+  } catch (error) {
+    try {
+      await OTP.deleteOne({ _id: passwordOtp._id });
+    } catch (cleanupError) {
+      console.error("Failed to clean up new OTP:", cleanupError);
+    }
+
+    throw error;
+  }
+
+  // 5. Delete previous password-reset OTPs
+  await OTP.deleteMany({
+    user: existingUser._id,
+    purpose: "password-reset",
+    _id: { $ne: passwordOtp._id }
+  });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      "Password-Reset OTP sent Successfully!!",
+      {
+        email: existingUser.email,
+        expiresIn: Math.ceil(
+          (expiresAt.getTime() - Date.now()) / 60000
+        ),
+        resendAfter: OTP_COOLDOWN / 1000
+      }
+    )
+  );
+});
+
+
+
+
+const resetPassword = asyncHandler(async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+
+  // 1. Validate request body
+  if (!email || !otp || !newPassword) {
+    throw new ApiError(
+      400,
+      "Email, OTP and new password are required!!"
+    );
+  }
+
+  if (typeof otp !== "string" || !/^\d{6}$/.test(otp)) {
+    throw new ApiError(400, "OTP must be a valid 6-digit code");
+  }
+
+  if (typeof newPassword !== "string" || newPassword.length < 8) {
+    throw new ApiError(
+      400,
+      "Password must contain at least 8 characters"
+    );
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  // 2. Find the latest password-reset OTP
+  const otpModel = await OTP.findOne({
+    email: normalizedEmail,
+    purpose: "password-reset"
+  }).sort({ createdAt: -1 });
+
+  if (!otpModel) {
+    throw new ApiError(
+      404,
+      "Password-reset OTP not found. Please request a new OTP."
+    );
+  }
+
+  // 3. Check OTP expiry
+  if (otpModel.expiresAt <= new Date()) {
+    await OTP.deleteOne({ _id: otpModel._id });
+
+    throw new ApiError(
+      410,
+      "OTP has expired. Please request a new OTP."
+    );
+  }
+
+  // 4. Check maximum attempts
+  if (otpModel.attempts >= MAX_OTP_SENDS) {
+    throw new ApiError(
+      429,
+      "Maximum OTP attempts reached. Please request a new OTP."
+    );
+  }
+
+  // 5. Verify OTP
+  const isOtpValid = await otpModel.isOtpCorrect(otp);
+
+  if (!isOtpValid) {
+    const updatedOtp = await OTP.findOneAndUpdate(
+      {
+        _id: otpModel._id,
+        attempts: { $lt: MAX_OTP_SENDS },
+        expiresAt: { $gt: new Date() }
+      },
+      {
+        $inc: { attempts: 1 }
+      },
+      { new: true }
+    );
+
+    if (!updatedOtp) {
+      throw new ApiError(
+        429,
+        "Maximum OTP attempts reached or OTP expired."
+      );
+    }
+
+    if (updatedOtp.attempts >= MAX_OTP_SENDS) {
+      throw new ApiError(
+        429,
+        "Maximum OTP attempts reached. Please request a new OTP."
+      );
+    }
+
+    throw new ApiError(401, "Invalid OTP");
+  }
+
+  // 6. Find the user
+  const existingUser = await User.findById(otpModel.user);
+
+  if (!existingUser) {
+    await OTP.deleteMany({
+      user: otpModel.user,
+      purpose: "password-reset"
+    });
+
+    throw new ApiError(404, "User not found");
+  }
+
+  // 7. Atomically consume the OTP
+  const consumedOtp = await OTP.findOneAndDelete({
+    _id: otpModel._id,
+    purpose: "password-reset",
+    attempts: { $lt: MAX_OTP_SENDS },
+    expiresAt: { $gt: new Date() }
+  });
+
+  if (!consumedOtp) {
+    throw new ApiError(
+      409,
+      "OTP has already been used or expired. Please try again."
+    );
+  }
+
+  // 8. Update the password
+  existingUser.password = newPassword;
+  await existingUser.save();
+
+  // 9. Delete any remaining password-reset OTPs
+  await OTP.deleteMany({
+    user: existingUser._id,
+    purpose: "password-reset"
+  });
+
+  // 10. Revoke existing sessions
+  await Session.deleteMany({
+    userId: existingUser._id
+  });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      "Password reset successfully!!",
+      {
+        email: existingUser.email
+      }
+    )
+  );
+});
+
 
 export {
   registerUser,
@@ -291,5 +823,8 @@ export {
   logout,
   logoutAllDevice,
   login,
-  verifyEmail
+  verifyEmail,
+  resendOTP,
+  forgotPassword,
+  resetPassword
 }
