@@ -13,9 +13,19 @@ const verifyjwt = asyncHandler(async(req,res,next)=>{
       throw new ApiError(401,"Unauthorized Request, Access token not found")
     }
   
-    const decodedToken = jwt.verify(accessToken,config.ACCESSTOKEN_SECRET);
-    if(!decodedToken){
-      throw new ApiError(401,"Invalid or expired access token")
+    let decodedToken;
+
+    try {
+      decodedToken = jwt.verify(
+        accessToken,
+        config.ACCESSTOKEN_SECRET
+      );
+    } catch (error) {
+      throw new ApiError(401, "Invalid or expired access token");
+    }
+
+    if (decodedToken.tokenType !== "access") {
+      throw new ApiError(401, "Invalid access token");
     }
   
     const session = await Session.findOne({

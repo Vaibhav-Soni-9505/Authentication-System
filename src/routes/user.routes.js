@@ -5,7 +5,7 @@ import { verifyjwt } from "../middleware/auth.middleware.js";
 const router = Router();
 
 router.route("/register").post(registerUser);
-router.route("/refresh-token").get(refreshAccessToken)
+router.route("/refresh-token").post(refreshAccessToken)
 router.route("/login").post(login)
 router.route("/verify-email").post(verifyEmail)
 router.route("/resend-otp").post(resendOTP)
@@ -14,7 +14,7 @@ router.route("/reset-password").post(resetPassword)
 
 //protected Routes
 router.route("/getuser").get(verifyjwt,getUser);
-router.route("/logout").get(verifyjwt,logout);
-router.route("/logout-all-device").get(verifyjwt,logoutAllDevice)
+router.route("/logout").post(verifyjwt,logout);
+router.route("/logout-all-device").post(verifyjwt,logoutAllDevice)
 
 export default router

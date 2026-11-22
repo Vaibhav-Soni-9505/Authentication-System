@@ -41,7 +41,7 @@ const generateAccessandRefreshToken = async(user,req)=>{
 const registerUser = asyncHandler(async(req,res)=>{
   const {username,email,password} = req.body;
   if(!username || !email || !password){
-    throw new ApiError(402,"All Fields are required!!")
+    throw new ApiError(400,"All Fields are required!!")
   }
 
   const existedUser = await User.findOne({
@@ -121,9 +121,13 @@ const login = asyncHandler(async(req,res)=>{
   }
 
   return res
-  .status(201)
+  .status(200)
   .cookie("refreshToken",refreshToken,options)
-  .json(new ApiResponse(201,"User LoggedIn Successfully!!",{username,email,accessToken}))
+  .json(new ApiResponse(200,"User LoggedIn Successfully!!",{
+    username:user.username,
+    email:user.email,
+    accessToken
+  }))
 
 })
 
@@ -146,8 +150,11 @@ const refreshAccessToken = asyncHandler(async(req,res)=>{
     throw new ApiError(401,"Unauthorized Request,Please login again!!")
   }
 
-  const decodedToken = jwt.verify(token,config.REFRESHTOKEN_SECRET);
-  if(!decodedToken){
+  let decodedToken;
+
+  try {
+    decodedToken = jwt.verify(token,config.REFRESHTOKEN_SECRET);
+  } catch (error) {
     throw new ApiError(401,"Invalid or expired refresh token")
   }
 
@@ -199,7 +206,7 @@ const logout = asyncHandler(async(req,res)=>{
   });
 
   if(!session){
-    throw new ApiError("Session revoked or expired")
+    throw new ApiError(401,"Session revoked or expired")
   }
 
   const options = {
@@ -350,7 +357,8 @@ const verifyEmail = asyncHandler(async (req, res) => {
 
   // 9. Delete any remaining OTP records
   await OTP.deleteMany({
-    user: consumedOtp.user
+    user: consumedOtp.user,
+    purpose: "email-verification"
   });
 
   return res.status(200).json(
