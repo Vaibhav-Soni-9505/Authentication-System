@@ -35,6 +35,6 @@ export const sendEmail = async (to, subject, text, html) => {
     console.log('Preview URL: %s', nodemailer.getTestMessageUrl(info));
   } catch (error) {
     console.error('Error sending email:', error);
-    throw new ApiError(401,"There was an error while sending the email")
+    throw new ApiError(502,"There was an error while sending the email")
   }
 };

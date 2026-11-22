@@ -7,7 +7,6 @@ import jwt from "jsonwebtoken"
 
 
 const verifyjwt = asyncHandler(async(req,res,next)=>{
-  try {
     const accessToken = req.headers?.authorization?.split(" ")[1];
     if(!accessToken){
       throw new ApiError(401,"Unauthorized Request, Access token not found")
@@ -48,9 +47,6 @@ const verifyjwt = asyncHandler(async(req,res,next)=>{
     req.session = session;
   
     next()
-  } catch (error) {
-    throw new ApiError(401,error.message || "Invalid Access Token!!");
-  }
 });
 
 export {verifyjwt};

@@ -178,7 +178,7 @@ const refreshAccessToken = asyncHandler(async(req,res)=>{
 
   const user = await User.findById(decodedToken._id);
   if(!user){
-    throw new ApiError("User not Found!!");
+    throw new ApiError(404,"User not Found!!");
   }
 
   const newAccessToken = await user.generateAccessToken(session._id)
@@ -320,12 +320,12 @@ const verifyEmail = asyncHandler(async (req, res) => {
   const existingUser = await User.findById(otpModel.user);
 
   if (!existingUser) {
-    await OTP.deleteMany({ user: otpModel.user });
+    await OTP.deleteMany({ user: otpModel.user,purpose: "email-verification" });
     throw new ApiError(404, "User not found");
   }
 
   if (existingUser.verified) {
-    await OTP.deleteMany({ user: otpModel.user });
+    await OTP.deleteMany({ user: otpModel.user,purpose: "email-verification" });
 
     throw new ApiError(400, "Email is already verified");
   }
@@ -607,6 +607,9 @@ const forgotPassword = asyncHandler(async (req, res) => {
   // 2. Handle rate-limit failure
   if (!updatedUser) {
     const latestUser = await User.findById(existingUser._id);
+    if (!latestUser) {
+      throw new ApiError(404, "User not found");
+    }
 
     const cooldownRemaining = latestUser.passwordOtpLastSentAt
       ? OTP_COOLDOWN -
